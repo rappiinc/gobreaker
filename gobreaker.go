@@ -104,6 +104,7 @@ type Settings struct {
 	Interval      time.Duration
 	Timeout       time.Duration
 	ReadyToTrip   func(counts Counts) bool
+	RecordError   func(err error) bool
 	OnStateChange func(name string, from State, to State)
 }
 
@@ -114,6 +115,7 @@ type CircuitBreaker struct {
 	interval      time.Duration
 	timeout       time.Duration
 	readyToTrip   func(counts Counts) bool
+	recordError   func(err error) bool
 	onStateChange func(name string, from State, to State)
 
 	mutex      sync.Mutex
@@ -161,6 +163,12 @@ func NewCircuitBreaker(st Settings) *CircuitBreaker {
 		cb.readyToTrip = st.ReadyToTrip
 	}
 
+	if st.RecordError == nil {
+		cb.recordError = defaultRecordError
+	} else {
+		cb.recordError = st.RecordError
+	}
+
 	cb.toNewGeneration(time.Now())
 
 	return cb
@@ -178,6 +186,10 @@ const defaultTimeout = time.Duration(60) * time.Second
 
 func defaultReadyToTrip(counts Counts) bool {
 	return counts.ConsecutiveFailures > 5
+}
+
+func defaultRecordError(err error) bool {
+	return true
 }
 
 // Name returns the name of the CircuitBreaker.
@@ -215,7 +227,7 @@ func (cb *CircuitBreaker) Execute(req func() (interface{}, error)) (interface{},
 	}()
 
 	result, err := req()
-	cb.afterRequest(generation, err == nil)
+	cb.afterRequest(generation, err == nil || !cb.recordError(err))
 	return result, err
 }
 

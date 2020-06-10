@@ -12,6 +12,7 @@ import (
 var defaultCB *CircuitBreaker
 var customCB *CircuitBreaker
 var negativeDurationCB *CircuitBreaker
+var customRecordErrorCB *CircuitBreaker
 
 type StateChange struct {
 	name string
@@ -55,7 +56,10 @@ func succeed2Step(cb *TwoStepCircuitBreaker) error {
 }
 
 func fail(cb *CircuitBreaker) error {
-	msg := "fail"
+	return failWithMessage(cb, "fail")
+}
+
+func failWithMessage(cb *CircuitBreaker, msg string) error {
 	_, err := cb.Execute(func() (interface{}, error) { return nil, fmt.Errorf(msg) })
 	if err.Error() == msg {
 		return nil
@@ -99,6 +103,14 @@ func newCustom() *CircuitBreaker {
 	return NewCircuitBreaker(customSt)
 }
 
+const msgErrorToRecord = "record me"
+
+func newCustomRecordErrorCB() *CircuitBreaker {
+	var customSt Settings
+	customSt.RecordError = func(err error) bool { return err.Error() == msgErrorToRecord }
+	return NewCircuitBreaker(customSt)
+}
+
 func newNegativeDurationCB() *CircuitBreaker {
 	var negativeSt Settings
 	negativeSt.Name = "ncb"
@@ -112,6 +124,7 @@ func init() {
 	defaultCB = NewCircuitBreaker(Settings{})
 	customCB = newCustom()
 	negativeDurationCB = newNegativeDurationCB()
+	customRecordErrorCB = newCustomRecordErrorCB()
 }
 
 func TestStateConstants(t *testing.T) {
@@ -132,6 +145,7 @@ func TestNewCircuitBreaker(t *testing.T) {
 	assert.Equal(t, time.Duration(0), defaultCB.interval)
 	assert.Equal(t, time.Duration(60)*time.Second, defaultCB.timeout)
 	assert.NotNil(t, defaultCB.readyToTrip)
+	assert.NotNil(t, negativeDurationCB.recordError)
 	assert.Nil(t, defaultCB.onStateChange)
 	assert.Equal(t, StateClosed, defaultCB.state)
 	assert.Equal(t, Counts{0, 0, 0, 0, 0}, defaultCB.counts)
@@ -144,6 +158,7 @@ func TestNewCircuitBreaker(t *testing.T) {
 	assert.Equal(t, time.Duration(90)*time.Second, customCB.timeout)
 	assert.NotNil(t, customCB.readyToTrip)
 	assert.NotNil(t, customCB.onStateChange)
+	assert.NotNil(t, negativeDurationCB.recordError)
 	assert.Equal(t, StateClosed, customCB.state)
 	assert.Equal(t, Counts{0, 0, 0, 0, 0}, customCB.counts)
 	assert.False(t, customCB.expiry.IsZero())
@@ -158,6 +173,9 @@ func TestNewCircuitBreaker(t *testing.T) {
 	assert.Equal(t, StateClosed, negativeDurationCB.state)
 	assert.Equal(t, Counts{0, 0, 0, 0, 0}, negativeDurationCB.counts)
 	assert.True(t, negativeDurationCB.expiry.IsZero())
+
+	customRecordErrorCB = newCustomRecordErrorCB()
+	assert.NotNil(t, negativeDurationCB.recordError)
 }
 
 func TestDefaultCircuitBreaker(t *testing.T) {
@@ -264,6 +282,36 @@ func TestCustomCircuitBreaker(t *testing.T) {
 	assert.Equal(t, Counts{0, 0, 0, 0, 0}, customCB.counts)
 	assert.False(t, customCB.expiry.IsZero())
 	assert.Equal(t, StateChange{"cb", StateHalfOpen, StateClosed}, stateChange)
+}
+
+func TestCustomRecordErrorCircuitBreaker(t *testing.T) {
+	assert.Equal(t, "", customRecordErrorCB.Name())
+
+	for i := 0; i < 5; i++ {
+		assert.Nil(t, failWithMessage(customRecordErrorCB, "do not record me"))
+	}
+
+	assert.Equal(t, StateClosed, customRecordErrorCB.State())
+	assert.Equal(t, Counts{
+		Requests:             5,
+		TotalSuccesses:       5,
+		TotalFailures:        0,
+		ConsecutiveSuccesses: 5,
+		ConsecutiveFailures:  0,
+	}, customRecordErrorCB.counts)
+
+	for i := 0; i < 5; i++ {
+		assert.Nil(t, failWithMessage(customRecordErrorCB, msgErrorToRecord))
+	}
+
+	assert.Equal(t, StateClosed, customRecordErrorCB.State())
+	assert.Equal(t, Counts{
+		Requests:             10,
+		TotalSuccesses:       5,
+		TotalFailures:        5,
+		ConsecutiveSuccesses: 0,
+		ConsecutiveFailures:  5,
+	}, customRecordErrorCB.counts)
 }
 
 func TestTwoStepCircuitBreaker(t *testing.T) {
