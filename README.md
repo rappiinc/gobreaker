@@ -58,9 +58,10 @@ type Settings struct {
   Default `ReadyToTrip` returns true when the number of consecutive failures is more than 5.
 
 - `RecordError` is called when a non-nil error is returned by the function, and intends to differentiate errors that should be used for tripping the circuit or not.
-  If `RecordError` returns true, `CircuitBreaker` will not consider the operation as successful
+  If `RecordError` returns true, `CircuitBreaker` will consider the error should be recorded, so the operation will be marked as unsuccessful
+  If `RecordError` returns false, `CircuitBreaker` will consider the error should *not* be recorded, so the operation will be marked as successful
 	If `RecordError` is `nil`, default `RecordError` is used.
-  Default `RecordError` returns true
+  Default `RecordError` considers all errors should be recorded
 
 - `OnStateChange` is called whenever the state of `CircuitBreaker` changes.
 
