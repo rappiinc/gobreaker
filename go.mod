@@ -1,4 +1,4 @@
-module github.com/sony/gobreaker
+module github.com/rappiinc/gobreaker
 
 go 1.12
 
