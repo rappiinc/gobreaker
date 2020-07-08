@@ -52,28 +52,111 @@ type Counts struct {
 	ConsecutiveFailures  uint32
 }
 
-func (c *Counts) onRequest() {
-	c.Requests++
+type countsPerMoment struct {
+	secondsToKeep int64
+	mutex         *sync.Mutex
+	counts        map[int64]*Counts
 }
 
-func (c *Counts) onSuccess() {
-	c.TotalSuccesses++
-	c.ConsecutiveSuccesses++
-	c.ConsecutiveFailures = 0
+func (c *countsPerMoment) getOrCreateCount(now int64) *Counts {
+	counts, ok := c.counts[now]
+	if !ok {
+		counts = &Counts{}
+		c.counts[now] = counts
+	}
+	return counts
+}
+func (c *countsPerMoment) prune(now time.Time) {
+	oldKeys := []int64{}
+
+	for k := range c.counts {
+		if k < (now.Unix() - c.secondsToKeep) {
+			oldKeys = append(oldKeys, k)
+		}
+	}
+
+	for _, k := range oldKeys {
+		delete(c.counts, k)
+	}
 }
 
-func (c *Counts) onFailure() {
-	c.TotalFailures++
-	c.ConsecutiveFailures++
-	c.ConsecutiveSuccesses = 0
+func (c *countsPerMoment) assembleCount(now time.Time) Counts {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	c.prune(now)
+
+	ret := Counts{}
+
+	accumulateConsecutivesSuccesses := true
+	accumulateConsecutivesFailures := true
+
+	timeLowerBound := now.Unix() - c.secondsToKeep
+
+	for moment := now.Unix(); moment >= timeLowerBound; moment-- {
+		counts := c.counts[moment]
+		if counts != nil {
+			ret.Requests = ret.Requests + counts.Requests
+			ret.TotalSuccesses = ret.TotalSuccesses + counts.TotalSuccesses
+			ret.TotalFailures = ret.TotalFailures + counts.TotalFailures
+			if accumulateConsecutivesSuccesses {
+				ret.ConsecutiveSuccesses = ret.ConsecutiveSuccesses + counts.ConsecutiveSuccesses
+			}
+			if accumulateConsecutivesFailures {
+				ret.ConsecutiveFailures = ret.ConsecutiveFailures + counts.ConsecutiveFailures
+			}
+			accumulateConsecutivesSuccesses = accumulateConsecutivesSuccesses && (ret.ConsecutiveSuccesses == ret.Requests)
+			accumulateConsecutivesFailures = accumulateConsecutivesFailures && (ret.ConsecutiveFailures == ret.Requests)
+		}
+	}
+	return ret
 }
 
-func (c *Counts) clear() {
-	c.Requests = 0
-	c.TotalSuccesses = 0
-	c.TotalFailures = 0
-	c.ConsecutiveSuccesses = 0
-	c.ConsecutiveFailures = 0
+func (c *countsPerMoment) onRequest(now time.Time) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	unix := now.Unix()
+	cc := c.getOrCreateCount(unix)
+
+	cc.Requests++
+
+	c.prune(now)
+}
+
+func (c *countsPerMoment) onSuccess(now time.Time) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	unix := now.Unix()
+	cc := c.getOrCreateCount(unix)
+
+	cc.TotalSuccesses++
+	cc.ConsecutiveSuccesses++
+	cc.ConsecutiveFailures = 0
+
+	c.prune(now)
+}
+
+func (c *countsPerMoment) onFailure(now time.Time) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	unix := now.Unix()
+	cc := c.getOrCreateCount(unix)
+
+	cc.TotalFailures++
+	cc.ConsecutiveFailures++
+	cc.ConsecutiveSuccesses = 0
+
+	c.prune(now)
+}
+
+func (c *countsPerMoment) clear() {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	c.counts = map[int64]*Counts{}
 }
 
 // Settings configures CircuitBreaker:
@@ -117,11 +200,12 @@ type CircuitBreaker struct {
 	readyToTrip   func(counts Counts) bool
 	recordError   func(err error) bool
 	onStateChange func(name string, from State, to State)
+	timeProvider  func() time.Time
 
 	mutex      sync.Mutex
 	state      State
 	generation uint64
-	counts     Counts
+	counts     countsPerMoment
 	expiry     time.Time
 }
 
@@ -138,6 +222,9 @@ func NewCircuitBreaker(st Settings) *CircuitBreaker {
 
 	cb.name = st.Name
 	cb.onStateChange = st.OnStateChange
+	cb.timeProvider = func() time.Time {
+		return time.Now()
+	}
 
 	if st.MaxRequests == 0 {
 		cb.maxRequests = 1
@@ -145,10 +232,13 @@ func NewCircuitBreaker(st Settings) *CircuitBreaker {
 		cb.maxRequests = st.MaxRequests
 	}
 
+	secondsToKeep := int64(120)
+
 	if st.Interval <= 0 {
 		cb.interval = defaultInterval
 	} else {
 		cb.interval = st.Interval
+		secondsToKeep = int64(st.Interval / time.Second)
 	}
 
 	if st.Timeout <= 0 {
@@ -169,7 +259,13 @@ func NewCircuitBreaker(st Settings) *CircuitBreaker {
 		cb.recordError = st.RecordError
 	}
 
-	cb.toNewGeneration(time.Now())
+	cb.counts = countsPerMoment{
+		counts:        map[int64]*Counts{},
+		mutex:         &sync.Mutex{},
+		secondsToKeep: secondsToKeep,
+	}
+
+	cb.toNewGeneration(cb.timeProvider())
 
 	return cb
 }
@@ -202,7 +298,7 @@ func (cb *CircuitBreaker) State() State {
 	cb.mutex.Lock()
 	defer cb.mutex.Unlock()
 
-	now := time.Now()
+	now := cb.timeProvider()
 	state, _ := cb.currentState(now)
 	return state
 }
@@ -259,16 +355,16 @@ func (cb *CircuitBreaker) beforeRequest() (uint64, error) {
 	cb.mutex.Lock()
 	defer cb.mutex.Unlock()
 
-	now := time.Now()
+	now := cb.timeProvider()
 	state, generation := cb.currentState(now)
 
 	if state == StateOpen {
 		return generation, ErrOpenState
-	} else if state == StateHalfOpen && cb.counts.Requests >= cb.maxRequests {
+	} else if state == StateHalfOpen && cb.counts.assembleCount(now).Requests >= cb.maxRequests {
 		return generation, ErrTooManyRequests
 	}
 
-	cb.counts.onRequest()
+	cb.counts.onRequest(now)
 	return generation, nil
 }
 
@@ -276,7 +372,7 @@ func (cb *CircuitBreaker) afterRequest(before uint64, success bool) {
 	cb.mutex.Lock()
 	defer cb.mutex.Unlock()
 
-	now := time.Now()
+	now := cb.timeProvider()
 	state, generation := cb.currentState(now)
 	if generation != before {
 		return
@@ -292,10 +388,10 @@ func (cb *CircuitBreaker) afterRequest(before uint64, success bool) {
 func (cb *CircuitBreaker) onSuccess(state State, now time.Time) {
 	switch state {
 	case StateClosed:
-		cb.counts.onSuccess()
+		cb.counts.onSuccess(now)
 	case StateHalfOpen:
-		cb.counts.onSuccess()
-		if cb.counts.ConsecutiveSuccesses >= cb.maxRequests {
+		cb.counts.onSuccess(now)
+		if cb.counts.assembleCount(now).ConsecutiveSuccesses >= cb.maxRequests {
 			cb.setState(StateClosed, now)
 		}
 	}
@@ -304,8 +400,8 @@ func (cb *CircuitBreaker) onSuccess(state State, now time.Time) {
 func (cb *CircuitBreaker) onFailure(state State, now time.Time) {
 	switch state {
 	case StateClosed:
-		cb.counts.onFailure()
-		if cb.readyToTrip(cb.counts) {
+		cb.counts.onFailure(now)
+		if cb.readyToTrip(cb.counts.assembleCount(now)) {
 			cb.setState(StateOpen, now)
 		}
 	case StateHalfOpen:
@@ -315,10 +411,10 @@ func (cb *CircuitBreaker) onFailure(state State, now time.Time) {
 
 func (cb *CircuitBreaker) currentState(now time.Time) (State, uint64) {
 	switch cb.state {
-	case StateClosed:
-		if !cb.expiry.IsZero() && cb.expiry.Before(now) {
-			cb.toNewGeneration(now)
-		}
+	//case StateClosed:
+	//	if !cb.expiry.IsZero() && cb.expiry.Before(now) {
+	//		cb.toNewGeneration(now)
+	//	}
 	case StateOpen:
 		if cb.expiry.Before(now) {
 			cb.setState(StateHalfOpen, now)
