@@ -182,20 +182,19 @@ func (c *countsPerMoment) clear() {
 //
 // OnStateChange is called whenever the state of the CircuitBreaker changes.
 type Settings struct {
-	Name          string
-	MaxRequests   uint32
-	Interval      time.Duration
-	Timeout       time.Duration
-	ReadyToTrip   func(counts Counts) bool
-	RecordError   func(err error) bool
-	OnStateChange func(name string, from State, to State)
+	Name                string
+	MaxRequests         uint32
+	SecondsToAccountFor int64
+	Timeout             time.Duration
+	ReadyToTrip         func(counts Counts) bool
+	RecordError         func(err error) bool
+	OnStateChange       func(name string, from State, to State)
 }
 
 // CircuitBreaker is a state machine to prevent sending requests that are likely to fail.
 type CircuitBreaker struct {
 	name          string
 	maxRequests   uint32
-	interval      time.Duration
 	timeout       time.Duration
 	readyToTrip   func(counts Counts) bool
 	recordError   func(err error) bool
@@ -232,13 +231,12 @@ func NewCircuitBreaker(st Settings) *CircuitBreaker {
 		cb.maxRequests = st.MaxRequests
 	}
 
-	secondsToKeep := int64(120)
+	secondsToKeep := int64(0)
 
-	if st.Interval <= 0 {
-		cb.interval = defaultInterval
+	if st.SecondsToAccountFor <= 0 {
+		secondsToKeep = defaultSecondsToAccountFor
 	} else {
-		cb.interval = st.Interval
-		secondsToKeep = int64(st.Interval / time.Second)
+		secondsToKeep = st.SecondsToAccountFor
 	}
 
 	if st.Timeout <= 0 {
@@ -277,7 +275,7 @@ func NewTwoStepCircuitBreaker(st Settings) *TwoStepCircuitBreaker {
 	}
 }
 
-const defaultInterval = time.Duration(0) * time.Second
+const defaultSecondsToAccountFor = 120
 const defaultTimeout = time.Duration(60) * time.Second
 
 func defaultReadyToTrip(counts Counts) bool {
@@ -445,11 +443,7 @@ func (cb *CircuitBreaker) toNewGeneration(now time.Time) {
 	var zero time.Time
 	switch cb.state {
 	case StateClosed:
-		if cb.interval == 0 {
-			cb.expiry = zero
-		} else {
-			cb.expiry = now.Add(cb.interval)
-		}
+		cb.expiry = zero
 	case StateOpen:
 		cb.expiry = now.Add(cb.timeout)
 	default: // StateHalfOpen
