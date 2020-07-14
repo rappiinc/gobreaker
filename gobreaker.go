@@ -86,7 +86,7 @@ func (c *countsPerMoment) assembleCount(now time.Time) Counts {
 
 	c.prune(now)
 
-	accumulatedCount := Counts{}
+	timeWindowMetrics := Counts{}
 
 	accumulateConsecutivesSuccesses := true
 	accumulateConsecutivesFailures := true
@@ -96,20 +96,20 @@ func (c *countsPerMoment) assembleCount(now time.Time) Counts {
 	for moment := now.Unix(); moment >= timeLowerBound; moment-- {
 		counts := c.counts[moment]
 		if counts != nil {
-			accumulatedCount.Requests = accumulatedCount.Requests + counts.Requests
-			accumulatedCount.TotalSuccesses = accumulatedCount.TotalSuccesses + counts.TotalSuccesses
-			accumulatedCount.TotalFailures = accumulatedCount.TotalFailures + counts.TotalFailures
+			timeWindowMetrics.Requests += counts.Requests
+			timeWindowMetrics.TotalSuccesses += counts.TotalSuccesses
+			timeWindowMetrics.TotalFailures += counts.TotalFailures
 			if accumulateConsecutivesSuccesses {
-				accumulatedCount.ConsecutiveSuccesses = accumulatedCount.ConsecutiveSuccesses + counts.ConsecutiveSuccesses
+				timeWindowMetrics.ConsecutiveSuccesses += counts.ConsecutiveSuccesses
 			}
 			if accumulateConsecutivesFailures {
-				accumulatedCount.ConsecutiveFailures = accumulatedCount.ConsecutiveFailures + counts.ConsecutiveFailures
+				timeWindowMetrics.ConsecutiveFailures += counts.ConsecutiveFailures
 			}
-			accumulateConsecutivesSuccesses = accumulateConsecutivesSuccesses && (accumulatedCount.ConsecutiveSuccesses == accumulatedCount.Requests)
-			accumulateConsecutivesFailures = accumulateConsecutivesFailures && (accumulatedCount.ConsecutiveFailures == accumulatedCount.Requests)
+			accumulateConsecutivesSuccesses = accumulateConsecutivesSuccesses && (timeWindowMetrics.ConsecutiveSuccesses == timeWindowMetrics.Requests)
+			accumulateConsecutivesFailures = accumulateConsecutivesFailures && (timeWindowMetrics.ConsecutiveFailures == timeWindowMetrics.Requests)
 		}
 	}
-	return accumulatedCount
+	return timeWindowMetrics
 }
 
 func (c *countsPerMoment) onRequest(now time.Time) {
