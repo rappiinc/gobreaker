@@ -59,23 +59,23 @@ type countsPerMoment struct {
 }
 
 func (c *countsPerMoment) getOrCreateCount(now int64) *Counts {
-	counts, ok := c.counts[now]
-	if !ok {
+	counts, exists := c.counts[now]
+	if !exists {
 		counts = &Counts{}
 		c.counts[now] = counts
 	}
 	return counts
 }
 func (c *countsPerMoment) prune(now time.Time) {
-	oldKeys := []int64{}
+	expiredKeys := []int64{}
 
 	for k := range c.counts {
 		if k < (now.Unix() - c.secondsToKeep) {
-			oldKeys = append(oldKeys, k)
+			expiredKeys = append(expiredKeys, k)
 		}
 	}
 
-	for _, k := range oldKeys {
+	for _, k := range expiredKeys {
 		delete(c.counts, k)
 	}
 }
@@ -86,7 +86,7 @@ func (c *countsPerMoment) assembleCount(now time.Time) Counts {
 
 	c.prune(now)
 
-	ret := Counts{}
+	accumulatedCount := Counts{}
 
 	accumulateConsecutivesSuccesses := true
 	accumulateConsecutivesFailures := true
@@ -96,20 +96,20 @@ func (c *countsPerMoment) assembleCount(now time.Time) Counts {
 	for moment := now.Unix(); moment >= timeLowerBound; moment-- {
 		counts := c.counts[moment]
 		if counts != nil {
-			ret.Requests = ret.Requests + counts.Requests
-			ret.TotalSuccesses = ret.TotalSuccesses + counts.TotalSuccesses
-			ret.TotalFailures = ret.TotalFailures + counts.TotalFailures
+			accumulatedCount.Requests = accumulatedCount.Requests + counts.Requests
+			accumulatedCount.TotalSuccesses = accumulatedCount.TotalSuccesses + counts.TotalSuccesses
+			accumulatedCount.TotalFailures = accumulatedCount.TotalFailures + counts.TotalFailures
 			if accumulateConsecutivesSuccesses {
-				ret.ConsecutiveSuccesses = ret.ConsecutiveSuccesses + counts.ConsecutiveSuccesses
+				accumulatedCount.ConsecutiveSuccesses = accumulatedCount.ConsecutiveSuccesses + counts.ConsecutiveSuccesses
 			}
 			if accumulateConsecutivesFailures {
-				ret.ConsecutiveFailures = ret.ConsecutiveFailures + counts.ConsecutiveFailures
+				accumulatedCount.ConsecutiveFailures = accumulatedCount.ConsecutiveFailures + counts.ConsecutiveFailures
 			}
-			accumulateConsecutivesSuccesses = accumulateConsecutivesSuccesses && (ret.ConsecutiveSuccesses == ret.Requests)
-			accumulateConsecutivesFailures = accumulateConsecutivesFailures && (ret.ConsecutiveFailures == ret.Requests)
+			accumulateConsecutivesSuccesses = accumulateConsecutivesSuccesses && (accumulatedCount.ConsecutiveSuccesses == accumulatedCount.Requests)
+			accumulateConsecutivesFailures = accumulateConsecutivesFailures && (accumulatedCount.ConsecutiveFailures == accumulatedCount.Requests)
 		}
 	}
-	return ret
+	return accumulatedCount
 }
 
 func (c *countsPerMoment) onRequest(now time.Time) {
