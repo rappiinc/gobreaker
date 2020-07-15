@@ -409,10 +409,6 @@ func (cb *CircuitBreaker) onFailure(state State, now time.Time) {
 
 func (cb *CircuitBreaker) currentState(now time.Time) (State, uint64) {
 	switch cb.state {
-	//case StateClosed:
-	//	if !cb.expiry.IsZero() && cb.expiry.Before(now) {
-	//		cb.toNewGeneration(now)
-	//	}
 	case StateOpen:
 		if cb.expiry.Before(now) {
 			cb.setState(StateHalfOpen, now)
@@ -442,11 +438,9 @@ func (cb *CircuitBreaker) toNewGeneration(now time.Time) {
 
 	var zero time.Time
 	switch cb.state {
-	case StateClosed:
-		cb.expiry = zero
 	case StateOpen:
 		cb.expiry = now.Add(cb.timeout)
-	default: // StateHalfOpen
+	default: // StateHalfOpen, StateClosed
 		cb.expiry = zero
 	}
 }
