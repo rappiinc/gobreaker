@@ -23,8 +23,10 @@ type StateChange struct {
 var stateChange StateChange
 
 func pseudoSleep(cb *CircuitBreaker, period time.Duration) {
-	if !cb.expiry.IsZero() {
-		cb.expiry = cb.expiry.Add(-period)
+	f := cb.timeProvider
+
+	cb.timeProvider = func() time.Time {
+		return f().Add(period)
 	}
 }
 
@@ -33,16 +35,19 @@ func succeed(cb *CircuitBreaker) error {
 	return err
 }
 
-func succeedLater(cb *CircuitBreaker, delay time.Duration) <-chan error {
+func succeedLater(cb *CircuitBreaker, delay time.Duration) (<-chan bool, <-chan error) {
 	ch := make(chan error)
+	startedCh := make(chan bool)
+
 	go func() {
 		_, err := cb.Execute(func() (interface{}, error) {
+			startedCh <- true
 			time.Sleep(delay)
 			return nil, nil
 		})
 		ch <- err
 	}()
-	return ch
+	return startedCh, ch
 }
 
 func succeed2Step(cb *TwoStepCircuitBreaker) error {
@@ -86,14 +91,11 @@ func newCustom() *CircuitBreaker {
 	var customSt Settings
 	customSt.Name = "cb"
 	customSt.MaxRequests = 3
-	customSt.Interval = time.Duration(30) * time.Second
+	customSt.SecondsToAccountFor = int64(30)
 	customSt.Timeout = time.Duration(90) * time.Second
 	customSt.ReadyToTrip = func(counts Counts) bool {
 		numReqs := counts.Requests
 		failureRatio := float64(counts.TotalFailures) / float64(numReqs)
-
-		counts.clear() // no effect on customCB.counts
-
 		return numReqs >= 3 && failureRatio >= 0.6
 	}
 	customSt.OnStateChange = func(name string, from State, to State) {
@@ -114,7 +116,7 @@ func newCustomRecordErrorCB() *CircuitBreaker {
 func newNegativeDurationCB() *CircuitBreaker {
 	var negativeSt Settings
 	negativeSt.Name = "ncb"
-	negativeSt.Interval = time.Duration(-30) * time.Second
+	negativeSt.SecondsToAccountFor = int64(-30)
 	negativeSt.Timeout = time.Duration(-90) * time.Second
 
 	return NewCircuitBreaker(negativeSt)
@@ -142,36 +144,36 @@ func TestNewCircuitBreaker(t *testing.T) {
 	defaultCB := NewCircuitBreaker(Settings{})
 	assert.Equal(t, "", defaultCB.name)
 	assert.Equal(t, uint32(1), defaultCB.maxRequests)
-	assert.Equal(t, time.Duration(0), defaultCB.interval)
+	assert.Equal(t, int64(120), defaultCB.counts.secondsToKeep)
 	assert.Equal(t, time.Duration(60)*time.Second, defaultCB.timeout)
 	assert.NotNil(t, defaultCB.readyToTrip)
 	assert.NotNil(t, negativeDurationCB.recordError)
 	assert.Nil(t, defaultCB.onStateChange)
 	assert.Equal(t, StateClosed, defaultCB.state)
-	assert.Equal(t, Counts{0, 0, 0, 0, 0}, defaultCB.counts)
+	assert.Equal(t, Counts{0, 0, 0, 0, 0}, defaultCB.counts.assembleCount(defaultCB.timeProvider()))
 	assert.True(t, defaultCB.expiry.IsZero())
 
 	customCB := newCustom()
 	assert.Equal(t, "cb", customCB.name)
 	assert.Equal(t, uint32(3), customCB.maxRequests)
-	assert.Equal(t, time.Duration(30)*time.Second, customCB.interval)
+	assert.Equal(t, int64(30), customCB.counts.secondsToKeep)
 	assert.Equal(t, time.Duration(90)*time.Second, customCB.timeout)
 	assert.NotNil(t, customCB.readyToTrip)
 	assert.NotNil(t, customCB.onStateChange)
 	assert.NotNil(t, negativeDurationCB.recordError)
 	assert.Equal(t, StateClosed, customCB.state)
-	assert.Equal(t, Counts{0, 0, 0, 0, 0}, customCB.counts)
-	assert.False(t, customCB.expiry.IsZero())
+	assert.Equal(t, Counts{0, 0, 0, 0, 0}, customCB.counts.assembleCount(customCB.timeProvider()))
+	assert.True(t, customCB.expiry.IsZero())
 
 	negativeDurationCB := newNegativeDurationCB()
 	assert.Equal(t, "ncb", negativeDurationCB.name)
 	assert.Equal(t, uint32(1), negativeDurationCB.maxRequests)
-	assert.Equal(t, time.Duration(0)*time.Second, negativeDurationCB.interval)
+	assert.Equal(t, int64(120), negativeDurationCB.counts.secondsToKeep)
 	assert.Equal(t, time.Duration(60)*time.Second, negativeDurationCB.timeout)
 	assert.NotNil(t, negativeDurationCB.readyToTrip)
 	assert.Nil(t, negativeDurationCB.onStateChange)
 	assert.Equal(t, StateClosed, negativeDurationCB.state)
-	assert.Equal(t, Counts{0, 0, 0, 0, 0}, negativeDurationCB.counts)
+	assert.Equal(t, Counts{0, 0, 0, 0, 0}, negativeDurationCB.counts.assembleCount(negativeDurationCB.timeProvider()))
 	assert.True(t, negativeDurationCB.expiry.IsZero())
 
 	customRecordErrorCB = newCustomRecordErrorCB()
@@ -179,33 +181,35 @@ func TestNewCircuitBreaker(t *testing.T) {
 }
 
 func TestDefaultCircuitBreaker(t *testing.T) {
+	defaultCB = NewCircuitBreaker(Settings{})
+
 	assert.Equal(t, "", defaultCB.Name())
 
 	for i := 0; i < 5; i++ {
 		assert.Nil(t, fail(defaultCB))
 	}
 	assert.Equal(t, StateClosed, defaultCB.State())
-	assert.Equal(t, Counts{5, 0, 5, 0, 5}, defaultCB.counts)
+	assert.Equal(t, Counts{5, 0, 5, 0, 5}, defaultCB.counts.assembleCount(defaultCB.timeProvider()))
 
 	assert.Nil(t, succeed(defaultCB))
 	assert.Equal(t, StateClosed, defaultCB.State())
-	assert.Equal(t, Counts{6, 1, 5, 1, 0}, defaultCB.counts)
+	assert.Equal(t, Counts{6, 1, 5, 1, 0}, defaultCB.counts.assembleCount(defaultCB.timeProvider()))
 
 	assert.Nil(t, fail(defaultCB))
 	assert.Equal(t, StateClosed, defaultCB.State())
-	assert.Equal(t, Counts{7, 1, 6, 0, 1}, defaultCB.counts)
+	assert.Equal(t, Counts{7, 1, 6, 0, 1}, defaultCB.counts.assembleCount(defaultCB.timeProvider()))
 
 	// StateClosed to StateOpen
 	for i := 0; i < 5; i++ {
 		assert.Nil(t, fail(defaultCB)) // 6 consecutive failures
 	}
 	assert.Equal(t, StateOpen, defaultCB.State())
-	assert.Equal(t, Counts{0, 0, 0, 0, 0}, defaultCB.counts)
+	assert.Equal(t, Counts{0, 0, 0, 0, 0}, defaultCB.counts.assembleCount(defaultCB.timeProvider()))
 	assert.False(t, defaultCB.expiry.IsZero())
 
 	assert.Error(t, succeed(defaultCB))
 	assert.Error(t, fail(defaultCB))
-	assert.Equal(t, Counts{0, 0, 0, 0, 0}, defaultCB.counts)
+	assert.Equal(t, Counts{0, 0, 0, 0, 0}, defaultCB.counts.assembleCount(defaultCB.timeProvider()))
 
 	pseudoSleep(defaultCB, time.Duration(59)*time.Second)
 	assert.Equal(t, StateOpen, defaultCB.State())
@@ -218,7 +222,7 @@ func TestDefaultCircuitBreaker(t *testing.T) {
 	// StateHalfOpen to StateOpen
 	assert.Nil(t, fail(defaultCB))
 	assert.Equal(t, StateOpen, defaultCB.State())
-	assert.Equal(t, Counts{0, 0, 0, 0, 0}, defaultCB.counts)
+	assert.Equal(t, Counts{0, 0, 0, 0, 0}, defaultCB.counts.assembleCount(defaultCB.timeProvider()))
 	assert.False(t, defaultCB.expiry.IsZero())
 
 	// StateOpen to StateHalfOpen
@@ -229,11 +233,13 @@ func TestDefaultCircuitBreaker(t *testing.T) {
 	// StateHalfOpen to StateClosed
 	assert.Nil(t, succeed(defaultCB))
 	assert.Equal(t, StateClosed, defaultCB.State())
-	assert.Equal(t, Counts{0, 0, 0, 0, 0}, defaultCB.counts)
+	assert.Equal(t, Counts{0, 0, 0, 0, 0}, defaultCB.counts.assembleCount(defaultCB.timeProvider()))
 	assert.True(t, defaultCB.expiry.IsZero())
 }
 
 func TestCustomCircuitBreaker(t *testing.T) {
+	customCB = newCustom()
+
 	assert.Equal(t, "cb", customCB.Name())
 
 	for i := 0; i < 5; i++ {
@@ -241,23 +247,24 @@ func TestCustomCircuitBreaker(t *testing.T) {
 		assert.Nil(t, fail(customCB))
 	}
 	assert.Equal(t, StateClosed, customCB.State())
-	assert.Equal(t, Counts{10, 5, 5, 0, 1}, customCB.counts)
+	assert.Equal(t, Counts{10, 5, 5, 0, 1}, customCB.counts.assembleCount(customCB.timeProvider()))
 
 	pseudoSleep(customCB, time.Duration(29)*time.Second)
 	assert.Nil(t, succeed(customCB))
 	assert.Equal(t, StateClosed, customCB.State())
-	assert.Equal(t, Counts{11, 6, 5, 1, 0}, customCB.counts)
+	assert.Equal(t, Counts{11, 6, 5, 1, 0}, customCB.counts.assembleCount(customCB.timeProvider()))
 
-	pseudoSleep(customCB, time.Duration(1)*time.Second) // over Interval
+	pseudoSleep(customCB, time.Duration(3)*time.Second) // over Interval
 	assert.Nil(t, fail(customCB))
 	assert.Equal(t, StateClosed, customCB.State())
-	assert.Equal(t, Counts{1, 0, 1, 0, 1}, customCB.counts)
+	assert.Equal(t, Counts{2, 1, 1, 0, 1}, customCB.counts.assembleCount(customCB.timeProvider()))
 
 	// StateClosed to StateOpen
 	assert.Nil(t, succeed(customCB))
+	assert.Nil(t, fail(customCB))
 	assert.Nil(t, fail(customCB)) // failure ratio: 2/3 >= 0.6
 	assert.Equal(t, StateOpen, customCB.State())
-	assert.Equal(t, Counts{0, 0, 0, 0, 0}, customCB.counts)
+	assert.Equal(t, Counts{0, 0, 0, 0, 0}, customCB.counts.assembleCount(customCB.timeProvider()))
 	assert.False(t, customCB.expiry.IsZero())
 	assert.Equal(t, StateChange{"cb", StateClosed, StateOpen}, stateChange)
 
@@ -270,17 +277,18 @@ func TestCustomCircuitBreaker(t *testing.T) {
 	assert.Nil(t, succeed(customCB))
 	assert.Nil(t, succeed(customCB))
 	assert.Equal(t, StateHalfOpen, customCB.State())
-	assert.Equal(t, Counts{2, 2, 0, 2, 0}, customCB.counts)
+	assert.Equal(t, Counts{2, 2, 0, 2, 0}, customCB.counts.assembleCount(customCB.timeProvider()))
 
 	// StateHalfOpen to StateClosed
-	ch := succeedLater(customCB, time.Duration(100)*time.Millisecond) // 3 consecutive successes
+	startedChannel, ch := succeedLater(customCB, time.Duration(100)*time.Millisecond) // 3 consecutive successes
+	<-startedChannel
 	time.Sleep(time.Duration(50) * time.Millisecond)
-	assert.Equal(t, Counts{3, 2, 0, 2, 0}, customCB.counts)
+	assert.Equal(t, Counts{3, 2, 0, 2, 0}, customCB.counts.assembleCount(customCB.timeProvider()))
 	assert.Error(t, succeed(customCB)) // over MaxRequests
 	assert.Nil(t, <-ch)
 	assert.Equal(t, StateClosed, customCB.State())
-	assert.Equal(t, Counts{0, 0, 0, 0, 0}, customCB.counts)
-	assert.False(t, customCB.expiry.IsZero())
+	assert.Equal(t, Counts{0, 0, 0, 0, 0}, customCB.counts.assembleCount(customCB.timeProvider()))
+	assert.True(t, customCB.expiry.IsZero())
 	assert.Equal(t, StateChange{"cb", StateHalfOpen, StateClosed}, stateChange)
 }
 
@@ -298,7 +306,7 @@ func TestCustomRecordErrorCircuitBreaker(t *testing.T) {
 		TotalFailures:        0,
 		ConsecutiveSuccesses: 5,
 		ConsecutiveFailures:  0,
-	}, customRecordErrorCB.counts)
+	}, customRecordErrorCB.counts.assembleCount(customRecordErrorCB.timeProvider()))
 
 	for i := 0; i < 5; i++ {
 		assert.Nil(t, failWithMessage(customRecordErrorCB, msgErrorToRecord))
@@ -311,7 +319,7 @@ func TestCustomRecordErrorCircuitBreaker(t *testing.T) {
 		TotalFailures:        5,
 		ConsecutiveSuccesses: 0,
 		ConsecutiveFailures:  5,
-	}, customRecordErrorCB.counts)
+	}, customRecordErrorCB.counts.assembleCount(customRecordErrorCB.timeProvider()))
 }
 
 func TestTwoStepCircuitBreaker(t *testing.T) {
@@ -323,27 +331,27 @@ func TestTwoStepCircuitBreaker(t *testing.T) {
 	}
 
 	assert.Equal(t, StateClosed, tscb.State())
-	assert.Equal(t, Counts{5, 0, 5, 0, 5}, tscb.cb.counts)
+	assert.Equal(t, Counts{5, 0, 5, 0, 5}, tscb.cb.counts.assembleCount(tscb.cb.timeProvider()))
 
 	assert.Nil(t, succeed2Step(tscb))
 	assert.Equal(t, StateClosed, tscb.State())
-	assert.Equal(t, Counts{6, 1, 5, 1, 0}, tscb.cb.counts)
+	assert.Equal(t, Counts{6, 1, 5, 1, 0}, tscb.cb.counts.assembleCount(tscb.cb.timeProvider()))
 
 	assert.Nil(t, fail2Step(tscb))
 	assert.Equal(t, StateClosed, tscb.State())
-	assert.Equal(t, Counts{7, 1, 6, 0, 1}, tscb.cb.counts)
+	assert.Equal(t, Counts{7, 1, 6, 0, 1}, tscb.cb.counts.assembleCount(tscb.cb.timeProvider()))
 
 	// StateClosed to StateOpen
 	for i := 0; i < 5; i++ {
 		assert.Nil(t, fail2Step(tscb)) // 6 consecutive failures
 	}
 	assert.Equal(t, StateOpen, tscb.State())
-	assert.Equal(t, Counts{0, 0, 0, 0, 0}, tscb.cb.counts)
+	assert.Equal(t, Counts{0, 0, 0, 0, 0}, tscb.cb.counts.assembleCount(tscb.cb.timeProvider()))
 	assert.False(t, tscb.cb.expiry.IsZero())
 
 	assert.Error(t, succeed2Step(tscb))
 	assert.Error(t, fail2Step(tscb))
-	assert.Equal(t, Counts{0, 0, 0, 0, 0}, tscb.cb.counts)
+	assert.Equal(t, Counts{0, 0, 0, 0, 0}, tscb.cb.counts.assembleCount(tscb.cb.timeProvider()))
 
 	pseudoSleep(tscb.cb, time.Duration(59)*time.Second)
 	assert.Equal(t, StateOpen, tscb.State())
@@ -356,7 +364,7 @@ func TestTwoStepCircuitBreaker(t *testing.T) {
 	// StateHalfOpen to StateOpen
 	assert.Nil(t, fail2Step(tscb))
 	assert.Equal(t, StateOpen, tscb.State())
-	assert.Equal(t, Counts{0, 0, 0, 0, 0}, tscb.cb.counts)
+	assert.Equal(t, Counts{0, 0, 0, 0, 0}, tscb.cb.counts.assembleCount(tscb.cb.timeProvider()))
 	assert.False(t, tscb.cb.expiry.IsZero())
 
 	// StateOpen to StateHalfOpen
@@ -367,32 +375,45 @@ func TestTwoStepCircuitBreaker(t *testing.T) {
 	// StateHalfOpen to StateClosed
 	assert.Nil(t, succeed2Step(tscb))
 	assert.Equal(t, StateClosed, tscb.State())
-	assert.Equal(t, Counts{0, 0, 0, 0, 0}, tscb.cb.counts)
+	assert.Equal(t, Counts{0, 0, 0, 0, 0}, tscb.cb.counts.assembleCount(tscb.cb.timeProvider()))
 	assert.True(t, tscb.cb.expiry.IsZero())
 }
 
 func TestPanicInRequest(t *testing.T) {
+	defaultCB = NewCircuitBreaker(Settings{})
+
 	assert.Panics(t, func() { causePanic(defaultCB) })
-	assert.Equal(t, Counts{1, 0, 1, 0, 1}, defaultCB.counts)
+	assert.Equal(t, Counts{1, 0, 1, 0, 1}, defaultCB.counts.assembleCount(defaultCB.timeProvider()))
 }
 
 func TestGeneration(t *testing.T) {
-	pseudoSleep(customCB, time.Duration(29)*time.Second)
-	assert.Nil(t, succeed(customCB))
-	ch := succeedLater(customCB, time.Duration(1500)*time.Millisecond)
-	time.Sleep(time.Duration(500) * time.Millisecond)
-	assert.Equal(t, Counts{2, 1, 0, 1, 0}, customCB.counts)
+	customCB = newCustom()
 
-	time.Sleep(time.Duration(500) * time.Millisecond) // over Interval
+	startedCh, ch := succeedLater(customCB, time.Duration(2)*time.Second)
+	<-startedCh
+
+	assert.Nil(t, fail(customCB))
+	assert.Nil(t, fail(customCB))
+	assert.NotNil(t, fail(customCB)) // We are open!
+
+	pseudoSleep(customCB, time.Duration(91)*time.Second)
+
+	assert.Nil(t, succeed(customCB))
+	assert.Nil(t, succeed(customCB))
+	assert.Nil(t, succeed(customCB)) // We are closed!
+
 	assert.Equal(t, StateClosed, customCB.State())
-	assert.Equal(t, Counts{0, 0, 0, 0, 0}, customCB.counts)
+	assert.Equal(t, Counts{0, 0, 0, 0, 0}, customCB.counts.assembleCount(customCB.timeProvider()))
 
 	// the request from the previous generation has no effect on customCB.counts
 	assert.Nil(t, <-ch)
-	assert.Equal(t, Counts{0, 0, 0, 0, 0}, customCB.counts)
+	assert.Equal(t, Counts{0, 0, 0, 0, 0}, customCB.counts.assembleCount(customCB.timeProvider()))
+
 }
 
 func TestCircuitBreakerInParallel(t *testing.T) {
+	customCB = newCustom()
+
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	ch := make(chan error)
@@ -414,5 +435,5 @@ func TestCircuitBreakerInParallel(t *testing.T) {
 		err := <-ch
 		assert.Nil(t, err)
 	}
-	assert.Equal(t, Counts{total, total, 0, total, 0}, customCB.counts)
+	assert.Equal(t, Counts{total, total, 0, total, 0}, customCB.counts.assembleCount(customCB.timeProvider()))
 }

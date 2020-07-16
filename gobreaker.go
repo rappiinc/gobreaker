@@ -52,28 +52,111 @@ type Counts struct {
 	ConsecutiveFailures  uint32
 }
 
-func (c *Counts) onRequest() {
-	c.Requests++
+type countsPerMoment struct {
+	secondsToKeep int64
+	mutex         *sync.Mutex
+	counts        map[int64]*Counts
 }
 
-func (c *Counts) onSuccess() {
-	c.TotalSuccesses++
-	c.ConsecutiveSuccesses++
-	c.ConsecutiveFailures = 0
+func (c *countsPerMoment) getOrCreateCount(now int64) *Counts {
+	counts, exists := c.counts[now]
+	if !exists {
+		counts = &Counts{}
+		c.counts[now] = counts
+	}
+	return counts
+}
+func (c *countsPerMoment) prune(now time.Time) {
+	expiredKeys := []int64{}
+
+	for k := range c.counts {
+		if k < (now.Unix() - c.secondsToKeep) {
+			expiredKeys = append(expiredKeys, k)
+		}
+	}
+
+	for _, k := range expiredKeys {
+		delete(c.counts, k)
+	}
 }
 
-func (c *Counts) onFailure() {
-	c.TotalFailures++
-	c.ConsecutiveFailures++
-	c.ConsecutiveSuccesses = 0
+func (c *countsPerMoment) assembleCount(now time.Time) Counts {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	c.prune(now)
+
+	timeWindowMetrics := Counts{}
+
+	accumulateConsecutivesSuccesses := true
+	accumulateConsecutivesFailures := true
+
+	timeLowerBound := now.Unix() - c.secondsToKeep
+
+	for moment := now.Unix(); moment >= timeLowerBound; moment-- {
+		counts := c.counts[moment]
+		if counts != nil {
+			timeWindowMetrics.Requests += counts.Requests
+			timeWindowMetrics.TotalSuccesses += counts.TotalSuccesses
+			timeWindowMetrics.TotalFailures += counts.TotalFailures
+			if accumulateConsecutivesSuccesses {
+				timeWindowMetrics.ConsecutiveSuccesses += counts.ConsecutiveSuccesses
+			}
+			if accumulateConsecutivesFailures {
+				timeWindowMetrics.ConsecutiveFailures += counts.ConsecutiveFailures
+			}
+			accumulateConsecutivesSuccesses = accumulateConsecutivesSuccesses && (timeWindowMetrics.ConsecutiveSuccesses == timeWindowMetrics.Requests)
+			accumulateConsecutivesFailures = accumulateConsecutivesFailures && (timeWindowMetrics.ConsecutiveFailures == timeWindowMetrics.Requests)
+		}
+	}
+	return timeWindowMetrics
 }
 
-func (c *Counts) clear() {
-	c.Requests = 0
-	c.TotalSuccesses = 0
-	c.TotalFailures = 0
-	c.ConsecutiveSuccesses = 0
-	c.ConsecutiveFailures = 0
+func (c *countsPerMoment) onRequest(now time.Time) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	unix := now.Unix()
+	cc := c.getOrCreateCount(unix)
+
+	cc.Requests++
+
+	c.prune(now)
+}
+
+func (c *countsPerMoment) onSuccess(now time.Time) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	unix := now.Unix()
+	cc := c.getOrCreateCount(unix)
+
+	cc.TotalSuccesses++
+	cc.ConsecutiveSuccesses++
+	cc.ConsecutiveFailures = 0
+
+	c.prune(now)
+}
+
+func (c *countsPerMoment) onFailure(now time.Time) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	unix := now.Unix()
+	cc := c.getOrCreateCount(unix)
+
+	cc.TotalFailures++
+	cc.ConsecutiveFailures++
+	cc.ConsecutiveSuccesses = 0
+
+	c.prune(now)
+}
+
+func (c *countsPerMoment) clear() {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	c.counts = map[int64]*Counts{}
 }
 
 // Settings configures CircuitBreaker:
@@ -99,29 +182,29 @@ func (c *Counts) clear() {
 //
 // OnStateChange is called whenever the state of the CircuitBreaker changes.
 type Settings struct {
-	Name          string
-	MaxRequests   uint32
-	Interval      time.Duration
-	Timeout       time.Duration
-	ReadyToTrip   func(counts Counts) bool
-	RecordError   func(err error) bool
-	OnStateChange func(name string, from State, to State)
+	Name                string
+	MaxRequests         uint32
+	SecondsToAccountFor int64
+	Timeout             time.Duration
+	ReadyToTrip         func(counts Counts) bool
+	RecordError         func(err error) bool
+	OnStateChange       func(name string, from State, to State)
 }
 
 // CircuitBreaker is a state machine to prevent sending requests that are likely to fail.
 type CircuitBreaker struct {
 	name          string
 	maxRequests   uint32
-	interval      time.Duration
 	timeout       time.Duration
 	readyToTrip   func(counts Counts) bool
 	recordError   func(err error) bool
 	onStateChange func(name string, from State, to State)
+	timeProvider  func() time.Time
 
 	mutex      sync.Mutex
 	state      State
 	generation uint64
-	counts     Counts
+	counts     countsPerMoment
 	expiry     time.Time
 }
 
@@ -138,6 +221,9 @@ func NewCircuitBreaker(st Settings) *CircuitBreaker {
 
 	cb.name = st.Name
 	cb.onStateChange = st.OnStateChange
+	cb.timeProvider = func() time.Time {
+		return time.Now()
+	}
 
 	if st.MaxRequests == 0 {
 		cb.maxRequests = 1
@@ -145,10 +231,12 @@ func NewCircuitBreaker(st Settings) *CircuitBreaker {
 		cb.maxRequests = st.MaxRequests
 	}
 
-	if st.Interval <= 0 {
-		cb.interval = defaultInterval
+	secondsToKeep := int64(0)
+
+	if st.SecondsToAccountFor <= 0 {
+		secondsToKeep = defaultSecondsToAccountFor
 	} else {
-		cb.interval = st.Interval
+		secondsToKeep = st.SecondsToAccountFor
 	}
 
 	if st.Timeout <= 0 {
@@ -169,7 +257,13 @@ func NewCircuitBreaker(st Settings) *CircuitBreaker {
 		cb.recordError = st.RecordError
 	}
 
-	cb.toNewGeneration(time.Now())
+	cb.counts = countsPerMoment{
+		counts:        map[int64]*Counts{},
+		mutex:         &sync.Mutex{},
+		secondsToKeep: secondsToKeep,
+	}
+
+	cb.toNewGeneration(cb.timeProvider())
 
 	return cb
 }
@@ -181,7 +275,7 @@ func NewTwoStepCircuitBreaker(st Settings) *TwoStepCircuitBreaker {
 	}
 }
 
-const defaultInterval = time.Duration(0) * time.Second
+const defaultSecondsToAccountFor = 120
 const defaultTimeout = time.Duration(60) * time.Second
 
 func defaultReadyToTrip(counts Counts) bool {
@@ -202,7 +296,7 @@ func (cb *CircuitBreaker) State() State {
 	cb.mutex.Lock()
 	defer cb.mutex.Unlock()
 
-	now := time.Now()
+	now := cb.timeProvider()
 	state, _ := cb.currentState(now)
 	return state
 }
@@ -259,16 +353,16 @@ func (cb *CircuitBreaker) beforeRequest() (uint64, error) {
 	cb.mutex.Lock()
 	defer cb.mutex.Unlock()
 
-	now := time.Now()
+	now := cb.timeProvider()
 	state, generation := cb.currentState(now)
 
 	if state == StateOpen {
 		return generation, ErrOpenState
-	} else if state == StateHalfOpen && cb.counts.Requests >= cb.maxRequests {
+	} else if state == StateHalfOpen && cb.counts.assembleCount(now).Requests >= cb.maxRequests {
 		return generation, ErrTooManyRequests
 	}
 
-	cb.counts.onRequest()
+	cb.counts.onRequest(now)
 	return generation, nil
 }
 
@@ -276,7 +370,7 @@ func (cb *CircuitBreaker) afterRequest(before uint64, success bool) {
 	cb.mutex.Lock()
 	defer cb.mutex.Unlock()
 
-	now := time.Now()
+	now := cb.timeProvider()
 	state, generation := cb.currentState(now)
 	if generation != before {
 		return
@@ -292,10 +386,10 @@ func (cb *CircuitBreaker) afterRequest(before uint64, success bool) {
 func (cb *CircuitBreaker) onSuccess(state State, now time.Time) {
 	switch state {
 	case StateClosed:
-		cb.counts.onSuccess()
+		cb.counts.onSuccess(now)
 	case StateHalfOpen:
-		cb.counts.onSuccess()
-		if cb.counts.ConsecutiveSuccesses >= cb.maxRequests {
+		cb.counts.onSuccess(now)
+		if cb.counts.assembleCount(now).ConsecutiveSuccesses >= cb.maxRequests {
 			cb.setState(StateClosed, now)
 		}
 	}
@@ -304,8 +398,8 @@ func (cb *CircuitBreaker) onSuccess(state State, now time.Time) {
 func (cb *CircuitBreaker) onFailure(state State, now time.Time) {
 	switch state {
 	case StateClosed:
-		cb.counts.onFailure()
-		if cb.readyToTrip(cb.counts) {
+		cb.counts.onFailure(now)
+		if cb.readyToTrip(cb.counts.assembleCount(now)) {
 			cb.setState(StateOpen, now)
 		}
 	case StateHalfOpen:
@@ -315,10 +409,6 @@ func (cb *CircuitBreaker) onFailure(state State, now time.Time) {
 
 func (cb *CircuitBreaker) currentState(now time.Time) (State, uint64) {
 	switch cb.state {
-	case StateClosed:
-		if !cb.expiry.IsZero() && cb.expiry.Before(now) {
-			cb.toNewGeneration(now)
-		}
 	case StateOpen:
 		if cb.expiry.Before(now) {
 			cb.setState(StateHalfOpen, now)
@@ -348,15 +438,9 @@ func (cb *CircuitBreaker) toNewGeneration(now time.Time) {
 
 	var zero time.Time
 	switch cb.state {
-	case StateClosed:
-		if cb.interval == 0 {
-			cb.expiry = zero
-		} else {
-			cb.expiry = now.Add(cb.interval)
-		}
 	case StateOpen:
 		cb.expiry = now.Add(cb.timeout)
-	default: // StateHalfOpen
+	default: // StateHalfOpen, StateClosed
 		cb.expiry = zero
 	}
 }
